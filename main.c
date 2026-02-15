@@ -1,88 +1,201 @@
 #define _GNU_SOURCE
-#include <sched.h>
+
 #include <stdio.h>
 #include <string.h>
-#include <sys/mount.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
+#include "build.h"
 #include "config.h"
+#include "image_store.h"
 #include "run.h"
 #include "setup.h"
 
-void resolve_docker_image_path(char* image_name_or_path) {
-  if(image_name_or_path[0] == '/') return;
-  char cmd[1024];
-  char resolved[512];
+static int append_run_command(struct config *cfg, const char *token) {
+  size_t current_len = strlen(cfg->command);
+  size_t token_len = strlen(token);
 
-  snprintf(cmd, sizeof(cmd), "docker inspect --format='{{.GraphDriver.Data.UpperDir}}' %s 2>/dev/null", image_name_or_path);
-
-  FILE* fp = popen(cmd, "r");
-  if(fp == NULL) return;
-
-  if(fgets(resolved, sizeof(resolved), fp) == NULL) {
-    pclose(fp);
-    fprintf(stderr, "[WARN] Can't find docker image: %s\n", image_name_or_path);
-    return;
+  if (current_len == 0) {
+    if (token_len + 1 >= sizeof(cfg->command)) {
+      return 1;
+    }
+    strcpy(cfg->command, token);
+    return 0;
   }
 
-  resolved[strcspn(resolved, "\r\n")] = 0;
-  if(strlen(resolved) > 0) {
-    strncpy(image_name_or_path, resolved, 511);
+  if (current_len + 1 + token_len + 1 >= sizeof(cfg->command)) {
+    return 1;
   }
 
-  pclose(fp);
+  strcat(cfg->command, " ");
+  strcat(cfg->command, token);
+  return 0;
+}
+
+static int parse_build_arg_value(const char *raw, struct config *cfg) {
+  const char *eq;
+  size_t key_len;
+
+  if (cfg->build_arg_count >= MAX_BUILD_ARGS) {
+    fprintf(stderr, "[ERR] Too many --build-arg values\n");
+    return 1;
+  }
+
+  eq = strchr(raw, '=');
+  if (eq == NULL) {
+    fprintf(stderr, "[ERR] Invalid --build-arg value: %s (use KEY=VALUE)\n", raw);
+    return 1;
+  }
+
+  key_len = (size_t)(eq - raw);
+  if (key_len == 0 || key_len >= sizeof(cfg->build_args[cfg->build_arg_count].key)) {
+    fprintf(stderr, "[ERR] Invalid --build-arg key: %s\n", raw);
+    return 1;
+  }
+
+  memcpy(cfg->build_args[cfg->build_arg_count].key, raw, key_len);
+  cfg->build_args[cfg->build_arg_count].key[key_len] = '\0';
+
+  snprintf(cfg->build_args[cfg->build_arg_count].value,
+           sizeof(cfg->build_args[cfg->build_arg_count].value), "%s", eq + 1);
+
+  cfg->build_arg_count++;
+  return 0;
 }
 
 int main(int argc, char **argv) {
+  struct config cfg;
+  int i = 1;
+
   if (setup_zocker_dir() != 0) {
     return 1;
   }
 
-  struct config cfg = {
-      .subcommand = NONE,
-      .name = "",
-      .command = "",
-      .base_image = "",
-  };
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.subcommand = NONE;
 
-  int i = 1;
   while (i < argc) {
     if (strcmp(argv[i], "run") == 0) {
       cfg.subcommand = RUN;
       i++;
-    } else if (strcmp(argv[i], "exec") == 0) {
+      continue;
+    }
+
+    if (strcmp(argv[i], "exec") == 0) {
       cfg.subcommand = EXEC;
       i++;
-    } else if (strcmp(argv[i], "--name") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "[ERR] Missing --name value (e.g. [--name bib]).\n");
-        return 1;
-      }
-      strncpy(cfg.name, argv[++i], sizeof(cfg.name) - 1);
-      i++;
-    } else if (strcmp(argv[i], "--base-dir") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "[ERR] Missing --base-dir value (e.g. [--base-dir "
-                        "/aboslute/path/to/base/dir]).\n");
-        return 1;
-      }
-      strncpy(cfg.base_dir, argv[++i], sizeof(cfg.base_dir) - 1);
-      i++;
-    } else if (strcmp(argv[i], "--base-image") == 0) {
-      if(i+1 >= argc) {
-        fprintf(stderr, "[ERR] Missing --base-image value.\n");
-        return 1;
-      }
-      strncpy(cfg.base_image, argv[++i], sizeof(cfg.base_image) - 1);
-      resolve_docker_image_path(cfg.base_image);
-      i++;
+      continue;
     }
-    
-    else {
-      strncpy(cfg.command, argv[i], sizeof(cfg.command) - 1);
+
+    if (strcmp(argv[i], "build") == 0) {
+      cfg.subcommand = BUILD;
       i++;
+      continue;
     }
+
+    if (strcmp(argv[i], "history") == 0) {
+      cfg.subcommand = HISTORY;
+      i++;
+      continue;
+    }
+
+    if (strcmp(argv[i], "images") == 0) {
+      cfg.subcommand = IMAGES;
+      i++;
+      continue;
+    }
+
+    if (strcmp(argv[i], "rmi") == 0) {
+      cfg.subcommand = RMI;
+      i++;
+      continue;
+    }
+
+    if (strcmp(argv[i], "prune") == 0) {
+      cfg.subcommand = PRUNE;
+      i++;
+      continue;
+    }
+
+    if (strcmp(argv[i], "--name") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "[ERR] Missing --name value\n");
+        return 1;
+      }
+      snprintf(cfg.name, sizeof(cfg.name), "%s", argv[++i]);
+      i++;
+      continue;
+    }
+
+    if (strcmp(argv[i], "--base-dir") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "[ERR] Missing --base-dir value\n");
+        return 1;
+      }
+      snprintf(cfg.base_dir, sizeof(cfg.base_dir), "%s", argv[++i]);
+      i++;
+      continue;
+    }
+
+    if (strcmp(argv[i], "--base-image") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "[ERR] Missing --base-image value\n");
+        return 1;
+      }
+      snprintf(cfg.base_image, sizeof(cfg.base_image), "%s", argv[++i]);
+      i++;
+      continue;
+    }
+
+    if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "[ERR] Missing -f/--file value\n");
+        return 1;
+      }
+      snprintf(cfg.zockerfile, sizeof(cfg.zockerfile), "%s", argv[++i]);
+      i++;
+      continue;
+    }
+
+    if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--tag") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "[ERR] Missing -t/--tag value\n");
+        return 1;
+      }
+      snprintf(cfg.image_ref, sizeof(cfg.image_ref), "%s", argv[++i]);
+      i++;
+      continue;
+    }
+
+    if (strcmp(argv[i], "--build-arg") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "[ERR] Missing --build-arg value\n");
+        return 1;
+      }
+      if (parse_build_arg_value(argv[++i], &cfg) != 0) {
+        return 1;
+      }
+      i++;
+      continue;
+    }
+
+    if (cfg.subcommand == RUN) {
+      if (append_run_command(&cfg, argv[i]) != 0) {
+        fprintf(stderr, "[ERR] run command is too long\n");
+        return 1;
+      }
+      i++;
+      continue;
+    }
+
+    if (cfg.subcommand == HISTORY || cfg.subcommand == RMI) {
+      if (cfg.image_ref[0] == '\0') {
+        snprintf(cfg.image_ref, sizeof(cfg.image_ref), "%s", argv[i]);
+        i++;
+        continue;
+      }
+    }
+
+    fprintf(stderr, "[ERR] Unknown/unsupported argument: %s\n", argv[i]);
+    return 1;
   }
 
   if (validate_config(&cfg) != 0) {
@@ -91,21 +204,48 @@ int main(int argc, char **argv) {
 
   switch (cfg.subcommand) {
   case RUN: {
-    struct container cont = {0};
+    struct container cont;
+    memset(&cont, 0, sizeof(cont));
     container_from_config(cfg, &cont);
-
     if (run_container(cont) != 0) {
-      fprintf(stderr,"[ERR] Running container failed due to some internal errors.\n");
+      fprintf(stderr,
+              "[ERR] Running container failed due to internal errors.\n");
       return 1;
     }
     break;
   }
+  case BUILD:
+    if (build_image_from_config(&cfg) != 0) {
+      return 1;
+    }
+    break;
+  case HISTORY:
+    if (print_image_history(cfg.image_ref) != 0) {
+      return 1;
+    }
+    break;
+  case IMAGES:
+    if (list_images() != 0) {
+      return 1;
+    }
+    break;
+  case RMI:
+    if (remove_image_ref(cfg.image_ref) != 0) {
+      return 1;
+    }
+    break;
+  case PRUNE:
+    if (prune_unused_layers() != 0) {
+      return 1;
+    }
+    break;
   case EXEC:
-    printf("EXEC subcommand have not implemented yet...\n");
+    printf("EXEC subcommand has not been implemented yet...\n");
     break;
   case NONE:
   default:
     break;
   }
+
   return 0;
 }
