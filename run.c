@@ -21,9 +21,22 @@ void container_from_config(struct config cfg, struct container *c) {
 
 int run_container(struct container cont) {
   pid_t pid;
+  int ns_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWTIME;
 
-  if (unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWTIME) != 0) {
-    return 1;
+  if (unshare(ns_flags) != 0) {
+    if (errno == EINVAL) {
+      ns_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS;
+      if (unshare(ns_flags) != 0) {
+        fprintf(stderr, "[ERR] Failed to unshare namespaces: %s\n",
+                strerror(errno));
+        return 1;
+      }
+      fprintf(stderr,
+              "[WARN] CLONE_NEWTIME is not supported; running without time namespace.\n");
+    } else {
+      fprintf(stderr, "[ERR] Failed to unshare namespaces: %s\n", strerror(errno));
+      return 1;
+    }
   }
 
   pid = fork();
@@ -32,10 +45,11 @@ int run_container(struct container cont) {
   }
 
   if (pid == 0) {
-    char container_dir[512];
+    char container_dir[4096];
     if (strlen(cont.base_dir) > 0) {
-      strcpy(container_dir, cont.base_dir);
-    } else if (setup_container_dir(cont.id, container_dir, cont.base_image) != 0) {
+      snprintf(container_dir, sizeof(container_dir), "%s", cont.base_dir);
+    } else if (setup_container_dir(cont.id, container_dir, sizeof(container_dir),
+                                   cont.base_image) != 0) {
       fprintf(stderr, "[ERR] Failed to setup container directory for %s\n",
               cont.id);
       return 1;
@@ -69,13 +83,11 @@ int run_container(struct container cont) {
     }
 
     if (mount(NULL, "/proc", "proc", 0, NULL) != 0) {
-      fprintf(stderr, "[ERR] Failed to remount /proc: %s\n", strerror(errno));
-      return 1;
+      fprintf(stderr, "[WARN] Failed to remount /proc: %s\n", strerror(errno));
     }
 
     if (sethostname(cont.id, 64) != 0) {
-      fprintf(stderr, "[ERR] Failed to set hostname\n");
-      return 1;
+      fprintf(stderr, "[WARN] Failed to set hostname: %s\n", strerror(errno));
     }
 
     printf("Running child with pid: %d\n", getpid());
@@ -85,8 +97,17 @@ int run_container(struct container cont) {
       return 1;
     }
   } else {
+    int status = 0;
     sleep(2);
-    waitpid(pid, NULL, 0);
+    if (waitpid(pid, &status, 0) < 0) {
+      fprintf(stderr, "[ERR] waitpid failed: %s\n", strerror(errno));
+      return 1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      fprintf(stderr, "[ERR] Container child failed with status=%d\n",
+              WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+      return 1;
+    }
     printf("[Parent] Stoping...\n");
   }
   return 0;
