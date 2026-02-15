@@ -517,3 +517,422 @@ int lookup_layer_cache(const char *hash, char *layer_id, size_t layer_id_size) {
 
   return 0;
 }
+
+int write_layer_metadata(const struct layer_meta *meta) {
+  char path[PATH_MAX];
+  FILE *fp;
+
+  if (meta == NULL || meta->id[0] == '\0') {
+    return 1;
+  }
+
+  snprintf(path, sizeof(path), "%s/%s/meta", ZOCKER_LAYERS_DIR, meta->id);
+  fp = fopen(path, "w");
+  if (fp == NULL) {
+    return 1;
+  }
+
+  fprintf(fp, "id=%s\n", meta->id);
+  fprintf(fp, "parent=%s\n", meta->parent);
+  fprintf(fp, "hash=%s\n", meta->hash);
+  fprintf(fp, "created_at=%ld\n", meta->created_at);
+  fprintf(fp, "size=%llu\n", meta->size);
+  fprintf(fp, "instruction=%s\n", meta->instruction);
+  fprintf(fp, "workdir=%s\n", meta->workdir);
+
+  fclose(fp);
+  return 0;
+}
+
+int read_layer_metadata(const char *layer_id, struct layer_meta *meta) {
+  char path[PATH_MAX];
+  FILE *fp;
+  char line[2048];
+
+  if (layer_id == NULL || meta == NULL) {
+    return 1;
+  }
+
+  memset(meta, 0, sizeof(*meta));
+  snprintf(meta->id, sizeof(meta->id), "%s", layer_id);
+
+  snprintf(path, sizeof(path), "%s/%s/meta", ZOCKER_LAYERS_DIR, layer_id);
+  fp = fopen(path, "r");
+  if (fp == NULL) {
+    return 1;
+  }
+
+  while (fgets(line, sizeof(line), fp) != NULL) {
+    char *eq = strchr(line, '=');
+    char *key;
+    char *value;
+
+    if (eq == NULL) {
+      continue;
+    }
+
+    *eq = '\0';
+    key = trim_whitespace(line);
+    value = trim_whitespace(eq + 1);
+    value[strcspn(value, "\r\n")] = '\0';
+
+    if (strcmp(key, "parent") == 0) {
+      snprintf(meta->parent, sizeof(meta->parent), "%s", value);
+    } else if (strcmp(key, "hash") == 0) {
+      snprintf(meta->hash, sizeof(meta->hash), "%s", value);
+    } else if (strcmp(key, "created_at") == 0) {
+      meta->created_at = strtol(value, NULL, 10);
+    } else if (strcmp(key, "size") == 0) {
+      meta->size = strtoull(value, NULL, 10);
+    } else if (strcmp(key, "instruction") == 0) {
+      snprintf(meta->instruction, sizeof(meta->instruction), "%s", value);
+    } else if (strcmp(key, "workdir") == 0) {
+      snprintf(meta->workdir, sizeof(meta->workdir), "%s", value);
+    }
+  }
+
+  fclose(fp);
+  return 0;
+}
+
+static void format_age(long created_at, char *out, size_t out_size) {
+  long now = (long)time(NULL);
+  long delta = now - created_at;
+
+  if (delta < 0) delta = 0;
+
+  if (delta < 60) {
+    snprintf(out, out_size, "%lds", delta);
+  } else if (delta < 3600) {
+    snprintf(out, out_size, "%ldm", delta / 60);
+  } else if (delta < 86400) {
+    snprintf(out, out_size, "%ldh", delta / 3600);
+  } else {
+    snprintf(out, out_size, "%ldd", delta / 86400);
+  }
+}
+
+int list_images(void) {
+  DIR *dir;
+  struct dirent *ent;
+
+  dir = opendir(ZOCKER_IMAGES_DIR);
+  if (dir == NULL) {
+    return 1;
+  }
+
+  printf("IMAGE\t\tTOP_LAYER\t\tCREATED\n");
+
+  while ((ent = readdir(dir)) != NULL) {
+    char path[PATH_MAX];
+    struct image_meta meta;
+
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+      continue;
+    }
+
+    if (!ends_with(ent->d_name, ".meta")) {
+      continue;
+    }
+
+    snprintf(path, sizeof(path), "%s/%s", ZOCKER_IMAGES_DIR, ent->d_name);
+    if (load_image_meta_from_path(path, &meta) == 0) {
+      printf("%s\t%s\t%s\n", meta.ref, meta.top_layer, meta.created_at);
+    }
+  }
+
+  closedir(dir);
+  return 0;
+}
+
+int print_image_history(const char *ref) {
+  struct image_meta image;
+  char current[64];
+  struct layer_meta *layers = NULL;
+  size_t layer_count = 0;
+
+  if (load_image_meta(ref, &image) != 0) {
+    fprintf(stderr, "[ERR] Image not found: %s\n", ref);
+    return 1;
+  }
+
+  snprintf(current, sizeof(current), "%s", image.top_layer);
+
+  while (current[0] != '\0') {
+    struct layer_meta meta;
+    struct layer_meta *new_layers;
+
+    if (read_layer_metadata(current, &meta) != 0) {
+      break;
+    }
+
+    new_layers = realloc(layers, sizeof(struct layer_meta) * (layer_count + 1));
+    if (new_layers == NULL) {
+      free(layers);
+      return 1;
+    }
+    layers = new_layers;
+    layers[layer_count++] = meta;
+
+    if (meta.parent[0] == '\0' || strcmp(meta.parent, "-") == 0) {
+      break;
+    }
+
+    snprintf(current, sizeof(current), "%s", meta.parent);
+  }
+
+  printf("LAYER\t\tSIZE\tAGE\tINSTRUCTION\n");
+  for (size_t i = 0; i < layer_count; i++) {
+    char age[32];
+    format_age(layers[i].created_at, age, sizeof(age));
+    printf("%s\t%llu\t%s\t%s\n", layers[i].id, layers[i].size, age,
+           layers[i].instruction);
+  }
+
+  free(layers);
+  return 0;
+}
+
+int remove_image_ref(const char *ref) {
+  char path[PATH_MAX];
+
+  if (image_meta_path_from_ref(ref, path, sizeof(path)) != 0) {
+    return 1;
+  }
+
+  if (unlink(path) != 0) {
+    if (errno == ENOENT) {
+      fprintf(stderr, "[ERR] Image not found: %s\n", ref);
+    }
+    return 1;
+  }
+
+  return 0;
+}
+
+struct str_set {
+  char **items;
+  size_t count;
+  size_t cap;
+};
+
+static void str_set_free(struct str_set *set) {
+  if (set == NULL) {
+    return;
+  }
+  for (size_t i = 0; i < set->count; i++) {
+    free(set->items[i]);
+  }
+  free(set->items);
+  set->items = NULL;
+  set->count = 0;
+  set->cap = 0;
+}
+
+static int str_set_contains(const struct str_set *set, const char *value) {
+  if (set == NULL || value == NULL) {
+    return 0;
+  }
+  for (size_t i = 0; i < set->count; i++) {
+    if (strcmp(set->items[i], value) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int str_set_add(struct str_set *set, const char *value) {
+  char *copy;
+
+  if (set == NULL || value == NULL || value[0] == '\0') {
+    return 1;
+  }
+
+  if (str_set_contains(set, value)) {
+    return 0;
+  }
+
+  if (set->count == set->cap) {
+    size_t new_cap = set->cap == 0 ? 32 : set->cap * 2;
+    char **new_items = realloc(set->items, new_cap * sizeof(char *));
+    if (new_items == NULL) {
+      return 1;
+    }
+    set->items = new_items;
+    set->cap = new_cap;
+  }
+
+  copy = strdup(value);
+  if (copy == NULL) {
+    return 1;
+  }
+
+  set->items[set->count++] = copy;
+  return 0;
+}
+
+static int mark_layer_chain_used(const char *top_layer, struct str_set *used) {
+  char current[64];
+
+  if (top_layer == NULL || top_layer[0] == '\0') {
+    return 0;
+  }
+
+  snprintf(current, sizeof(current), "%s", top_layer);
+  while (current[0] != '\0' && !str_set_contains(used, current)) {
+    struct layer_meta meta;
+
+    if (str_set_add(used, current) != 0) {
+      return 1;
+    }
+
+    if (read_layer_metadata(current, &meta) != 0) {
+      break;
+    }
+
+    if (meta.parent[0] == '\0' || strcmp(meta.parent, "-") == 0) {
+      break;
+    }
+
+    snprintf(current, sizeof(current), "%s", meta.parent);
+  }
+
+  return 0;
+}
+
+static int collect_used_layers(struct str_set *used) {
+  DIR *dir;
+  struct dirent *ent;
+
+  dir = opendir(ZOCKER_IMAGES_DIR);
+  if (dir == NULL) {
+    return 1;
+  }
+
+  while ((ent = readdir(dir)) != NULL) {
+    char path[PATH_MAX];
+    struct image_meta meta;
+
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+      continue;
+    }
+
+    if (!ends_with(ent->d_name, ".meta")) {
+      continue;
+    }
+
+    snprintf(path, sizeof(path), "%s/%s", ZOCKER_IMAGES_DIR, ent->d_name);
+    if (load_image_meta_from_path(path, &meta) != 0) {
+      continue;
+    }
+
+    if (mark_layer_chain_used(meta.top_layer, used) != 0) {
+      closedir(dir);
+      return 1;
+    }
+  }
+
+  closedir(dir);
+  return 0;
+}
+
+static int cleanup_cache_entries(void) {
+  DIR *dir;
+  struct dirent *ent;
+
+  dir = opendir(ZOCKER_CACHE_DIR);
+  if (dir == NULL) {
+    return 1;
+  }
+
+  while ((ent = readdir(dir)) != NULL) {
+    char path[PATH_MAX];
+    char layer_id[128];
+    FILE *fp;
+
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+      continue;
+    }
+
+    snprintf(path, sizeof(path), "%s/%s", ZOCKER_CACHE_DIR, ent->d_name);
+    fp = fopen(path, "r");
+    if (fp == NULL) {
+      continue;
+    }
+
+    if (fgets(layer_id, sizeof(layer_id), fp) == NULL) {
+      fclose(fp);
+      unlink(path);
+      continue;
+    }
+    fclose(fp);
+    layer_id[strcspn(layer_id, "\r\n")] = '\0';
+
+    if (!layer_exists(layer_id)) {
+      unlink(path);
+    }
+  }
+
+  closedir(dir);
+  return 0;
+}
+
+int prune_unused_layers(void) {
+  int total_removed = 0;
+
+  while (1) {
+    DIR *dir;
+    struct dirent *ent;
+    struct str_set used = {0};
+    int removed_in_round = 0;
+
+    if (collect_used_layers(&used) != 0) {
+      str_set_free(&used);
+      return 1;
+    }
+
+    dir = opendir(ZOCKER_LAYERS_DIR);
+    if (dir == NULL) {
+      str_set_free(&used);
+      return 1;
+    }
+
+    while ((ent = readdir(dir)) != NULL) {
+      char layer_path[PATH_MAX];
+
+      if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+        continue;
+      }
+
+      if (strcmp(ent->d_name, "l") == 0) {
+        continue;
+      }
+
+      snprintf(layer_path, sizeof(layer_path), "%s/%s", ZOCKER_LAYERS_DIR,
+               ent->d_name);
+      if (!is_directory(layer_path)) {
+        continue;
+      }
+
+      if (!str_set_contains(&used, ent->d_name)) {
+        if (remove_recursive(layer_path) == 0) {
+          removed_in_round++;
+        }
+      }
+    }
+
+    closedir(dir);
+    str_set_free(&used);
+
+    cleanup_cache_entries();
+
+    if (removed_in_round == 0) {
+      break;
+    }
+
+    total_removed += removed_in_round;
+  }
+
+  printf("Removed %d unused layers\n", total_removed);
+  return 0;
+}

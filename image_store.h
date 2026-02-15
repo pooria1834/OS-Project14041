@@ -34,3 +34,14 @@ int layer_chain_from_top(const char *layer_id, char *out_chain, size_t out_size)
 
 int register_layer_cache(const char *hash, const char *layer_id);
 int lookup_layer_cache(const char *hash, char *layer_id, size_t layer_id_size);
+
+int write_layer_metadata(const struct layer_meta *meta);
+int read_layer_metadata(const char *layer_id, struct layer_meta *meta);
+int layer_exists(const char *layer_id);
+
+int list_images(void);
+int print_image_history(const char *ref);
+int remove_image_ref(const char *ref);
+int prune_unused_layers(void);
+
+#endif
