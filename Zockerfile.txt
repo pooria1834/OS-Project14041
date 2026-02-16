@@ -1,0 +1,5 @@
+FROM alpine:3.22.2
+ARG FileName
+RUN echo "Hello from Zocker1!" > /${FileName}1.txt
+RUN echo "Hello from Zocker2!" > /${FileName}2.txt
+
